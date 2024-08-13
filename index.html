@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" href="data:,">
+    <title>addr parser</title>
+    <style>
+        body {
+            display: grid;
+            place-items: center;
+            margin: 50px;
+        }
+    </style>
+</head>
+<body>
+    <h1>addr parser</h1><br>
+    <form id="processFile">
+        Unstripped ELF & Crash Log: 
+        <input type="file" id="fileInput" name="files[]" multiple>
+        <br><br>
+        Which Addr Will Be Parsed:
+        <label>
+            <input type="radio" name="addrType" value="ADDR" checked>ADDR
+        </label>
+        <label>
+            <input type="radio" name="addrType" value="BIAS">BIAS
+        </label>
+        <br><br>
+        <button type="submit">Parse Log File</button>
+    </form>
+
+    <div id="errorMsg"></div>
+
+    <script>
+        const LOGI = console.log;
+        const LOGW = console.warn;
+        const LOGE = console.error;
+
+        let logInfo = [];
+        console.log = function (...args) {
+            logInfo.push(args.join(' '));
+        };
+
+        let logWarn = [];
+        console.warn = function (...args) {
+            logWarn.push(args.join(' '));
+        };
+
+        let logError = [];
+        console.error = function (...args) {
+            logError.push(args.join(' '));
+        };
+
+        function getLog(logLevel) {
+            let ret = logLevel.join('\n');
+            logLevel.length = 0;
+            return ret;
+        }
+    </script>
+    <script src="llvm-symbolizer.js"></script>
+    <script>
+        function addrParser(name, addr) {
+            const args = ['llvm-addr2line', '-Cfpie', name, addr];
+
+            const argc = args.length;
+            const argv = args.map(arg => Module.allocateUTF8(arg));
+            const argvPtr = Module._malloc(argv.length * 4);
+            for (let i = 0; i < argv.length; i++) {
+                Module.setValue(argvPtr + i * 4, argv[i], 'i32');
+            }
+            Module._main(argc, argvPtr);
+            Module._free(argvPtr);
+            argv.forEach(ptr => Module._free(ptr));
+        }
+
+        function createFile(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onerror = function(e) {
+                    reject(new Error('read error:' + e.target.error));
+                }
+                reader.onload = function(event) {
+                    try {
+                        const arrayBuffer = event.target.result;
+                        const uint8Array = new Uint8Array(arrayBuffer);
+                        if (FS.analyzePath(file.name).exists) {
+                            FS.unlink(file.name);
+                        }
+                        FS.createDataFile('/', file.name, uint8Array, true, false);
+                        resolve(file.name);
+                    } catch (e) {
+                        reject(new Error('create error:', e.target.error));
+                    }
+                };
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        async function isTextFile(file) {
+            if (!file) {
+                return false;
+            }
+            if (file.type.startsWith('text/')) {
+                return true;
+            }
+
+            const reader = new FileReader();
+            const promise = new Promise((resolve, reject) => {
+                reader.onload = function(e) {
+                    const content = e.target.result;
+                    const isText = /[\x00-\x08\x0E-\x1F\x7F]/.test(content) === false;
+                    resolve(isText);
+                };
+                reader.onerror = function() {
+                    reject(false);
+                };
+            });
+
+            reader.readAsText(file.slice(0, 1000));
+            return promise;
+        }
+
+        function downloadTextFile(text, filename) {
+            const blob = new Blob([text], {type: 'text/plain'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function getAddrType() {
+            const radios = document.querySelectorAll('input[name="addrType"]');
+            for (const radio of radios) {
+                if (radio.checked) {
+                    return radio.value;
+                }
+            }
+            return 'ADDR';
+        }
+
+        function matchNameAndAddr(line, addrType) {
+            let matchName = line.match(/\/.*?[()+]/g);
+            if (matchName) {
+                matchName = matchName[0].replace(/[()+]/g, '');
+                matchName = matchName.slice(matchName.lastIndexOf('/') + 1);
+            }
+
+            let matchAddr = line.match(/ 0x?[0-9a-fA-F]+/g);
+            if (matchAddr) {
+                matchAddr = matchAddr[0].trim();
+            }
+
+            if (addrType === 'BIAS') {
+                let matchBias = line.match(/\+.*?\)/g);
+                if (matchBias) {
+                    matchAddr = matchBias[0].replace(/[()+]/g, '');
+                }
+            }
+
+            if (matchName === 'ld-musl-aarch64-asan.so.1') {
+                matchName = 'libc.so'
+            }
+            return [matchName, matchAddr];
+        }
+    </script>
+    <script>
+        document.getElementById('processFile').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            const fileInput = document.getElementById('fileInput');
+            const files = fileInput.files;
+            const errorMsg = document.getElementById('errorMsg');
+            errorMsg.innerHTML = '';
+            const addrType = getAddrType();
+
+            for (const file of files) {
+                LOGI('creating:', file.name);
+                try {
+                    const filename = await createFile(file);
+                    LOGI('create succ:', filename)
+                } catch (e) {
+                    LOGE('create fail:', file.name, e);
+                }
+            }
+
+            for (const file of files) {
+                LOGI('parsing:', file.name);
+                const isText = await isTextFile(file);
+                if (!isText) {
+                    LOGI('is not text:', file.name);
+                    continue;
+                }
+                const reader = new FileReader();
+                reader.onerror = function(e) {
+                    LOGE('read fail:', file.name, e);
+                }
+                reader.onload = function(e) {
+                    let outText = '';
+                    const text = e.target.result;
+                    const lines = text.split('\n');
+                    for (const line of lines) {
+                        outText += line + '\n';
+                        if (!line.trim().startsWith('#')) {
+                            continue;
+                        }
+
+                        const [matchName, matchAddr] = matchNameAndAddr(line, addrType);
+
+                        if (!FS.analyzePath(matchName).exists) {
+                            LOGW('file not exist:', matchName);
+                            continue;
+                        }
+
+                        try {
+                            addrParser(matchName, matchAddr);
+                            let addrResult = getLog(logInfo);
+                            LOGI('parse succ:', file.name, ', result:', addrResult);
+                            outText += addrResult + '\n';
+                        } catch (e) {
+                            LOGE('parse fail:', file.name, e);
+                        }
+                    }
+
+                    downloadTextFile(outText, 'processed-' + file.name);
+                }
+                reader.readAsText(file);
+            }
+        });
+    </script>
+</body>
+</html>
